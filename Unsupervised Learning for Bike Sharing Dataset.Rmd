@@ -1,0 +1,557 @@
+---
+title: "Unsupervised Learning for Bike Sharing"
+output: html_document
+date: "2026-01-08"
+---
+
+## Load Libraries
+```{r}
+# Load required libraries
+library(DBI)
+library(dplyr)
+
+# For data visualisation
+library(ggplot2)
+library(gridExtra)
+library(cluster)
+library(factoextra)
+library(caTools)
+library(hms)           #Data formatting for hours min seconds
+library(GGally)         #Visualise correlarion
+library(leaflet)        #Geospatial plot
+library(lubridate)       #Date formatting
+library(car)             #Check for Collinearity
+```
+
+## Set Working Directory
+```{r}
+# Check working directory, if not ammend accordingly to the same location where the database is
+getwd()
+```
+
+## Load the Dataset 
+[link] -> https://www.kaggle.com/datasets/amykzhang/bergen-bike-sharing-dataset-2023/data
+```{r}
+# Load in the data from the csv file 
+bike <- read.csv("bergen_merged.csv", header = T)
+```
+
+## Exploration of Data
+```{r}
+# Check if thers any missing values
+sum(is.na(bike))
+
+# Check structure of dataset
+str(bike)
+
+# Inital Summary statistics
+summary(bike)
+```
+
+## Data Cleaning and Formatting
+```{r}
+# Convert to Date-Time format
+bike$start_time <- ymd_hms(bike$start_time)
+bike$end_time <- ymd_hms(bike$end_time)
+
+# Extract Year, Month, Day of Month, and Day of Week
+bike <- bike %>%
+  mutate(
+    year = year(start_time),
+    month = month(start_time, label = T, abbr = T), # Abbr month name
+    day_of_month = day(start_time),
+    day_of_week = wday(start_time, label = T, abbr = T),  # Abbr weekday name
+    season = factor(season, levels = 0:3, labels = c("Spring", "Summer", "Fall", "Winter")),  # Convert seasons
+    is_holiday = case_when( 
+      is_holiday == "True" ~ "Holiday",   # Change "True" to "Holiday"
+      is_holiday == "False" ~ "Non-Holiday",  # Change "False" to "Non-Holiday"
+    ),
+    is_weekend = case_when( 
+      is_weekend == "True" ~ "Weekend",   # Change "True" to "Weekend"
+      is_weekend == "False" ~ "Non-Weekend",  # Change "False" to "Non-Weekend"
+    )
+  )
+
+# Convert Duration (seconds) to minutes and hours
+bike <- bike %>%
+  mutate(
+    duration_min = duration / 60,     # Convert seconds to minutes
+    duration_hr = duration / 3600     # Convert seconds to hours
+  )
+
+# Extract Start Hour from Start Time
+bike$start_hour <- as.numeric(format(bike$start_time, "%H"))
+```
+
+## Exploratory Data Analysis (EDA)
+
+### Distribution of Holidays
+```{r}
+# Bar plot for categorical variable (e.g., season)
+ggplot(bike, aes(x = factor(is_holiday))) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Distribution of Holidays", x = "Season", y = "Frequency") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(), 
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 1))
+```
+The bar plot shows a highly imbalanced distribution between holidays and non-holidays, with significantly more non-holiday instances. This suggests that there is limited influence of holidays as a predictor in the machine learning models. 
+
+### Patterns in Bike Sharing Usage Across Time
+```{r}
+# First plot: Frequency of Bike Sharing by Month
+plot1 <- ggplot(bike, aes(x = factor(month), fill = season)) +
+  geom_bar(color = "black", alpha = 0.8) +
+  labs(title = "Frequency of Bike Sharing by Month", x = "Month", y = "Frequency", fill = "Season") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(), 
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 1))
+
+# Second plot: Frequency of Bike Sharing by Day of the Week
+most_frequent_day <- names(which.max(table(bike$day_of_week)))
+
+plot2 <- ggplot(bike, aes(x = factor(day_of_week))) +
+  geom_bar(stat = "count", fill = "maroon", color = "black", alpha = 0.7) +
+  geom_bar(data = subset(bike, day_of_week == most_frequent_day), aes(y = after_stat(count)), stat = "count", fill = "gold", color = "black", alpha = 0.7) +
+  labs(title = "Frequency of Bike Sharing by Day of the Week", x = "Day of Week", y = "Frequency") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(), panel.border = element_rect(color = "black", fill = NA, linewidth = 1))
+
+# Count the number of bike-sharing trips per season
+season_counts <- bike %>%
+  group_by(season) %>%
+  summarise(frequency = n())
+
+# Print out the frequency of bike sharing in each season
+print(season_counts)
+
+# Third plot: Hourly Bike Usage Across Seasons
+hourly_data <- bike %>%
+  group_by(start_hour, season) %>%
+  summarise(bike_usage = n(), .groups = "drop")
+
+plot3 <- ggplot(hourly_data, aes(x = start_hour, y = bike_usage, color = season)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Hourly Bike Usage Across Seasons", x = "Hour of the Day", y = "Frequency", color = "Season") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(), panel.border = element_rect(color = "black", fill = NA, linewidth = 1))
+
+# Fourth plot: Heatmap of Bike Usage by Day of Week and Hour of Day
+heatmap_data <- bike %>%
+  group_by(day_of_week, start_hour) %>%
+  summarise(bike_usage = n(), .groups = "drop")
+
+plot4 <- ggplot(heatmap_data, aes(x = start_hour, y = day_of_week, fill = bike_usage)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  labs(title = "Heatmap of Bike Usage by Day of Week and Hour of Day", 
+       x = "Hour of the Day", y = "Day of the Week", fill = "Bike Usage") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(), 
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 1)) +
+  scale_y_discrete(limits = rev(levels(bike$day_of_week)))  # To make the heatmap start from Sunday at the top
+
+# Combine all three plots in a grid (2 rows, 2 columns)
+grid.arrange(plot1, plot2, plot3, plot4, ncol = 2, nrow = 2)
+```
+The visualisations reveal distinct temporal trends in bike sharing usage, with clear seasonal and daily patterns. The data indicates that spring has the highest bike sharing activity, with 146,753 trips, followed closely by summer at 142,551 trips. Fall sees a noticeable drop to 105,757 trips, while winter records the lowest usage at 72,800 trips, confirming a strong seasonal influence.
+
+Monthly trends show peak demand in June and August, aligning with the higher activity levels in spring and summer, while winter months exhibit the lowest usage. 
+  
+Weekly patterns indicate that Thursday has the highest bike sharing usage, suggesting it may be a particularly active day for commuters. Overall, usage is highest on weekdays, particularly from Monday to Thursday, and significantly lower on weekends, reinforcing the strong correlation with commuting habits. 
+
+Hourly usage follows a bimodal distribution, with peaks during morning and evening rush hours, reinforcing the idea that bike-sharing demand is primarily driven by work and school commutes. 
+
+The heatmap further supports these findings, highlighting the highest activity levels during weekday mornings and evenings, with reduced usage at night and on weekends.
+
+### Pairwise Correlation and Distribution Analysis
+```{r}
+# Select relevant columns
+weather_correlation_data <- subset(bike, select = c(duration_hr, precipitation, temperature, wind_speed, sunshine))
+
+# Scatterplot matrix with correlations
+ggpairs(weather_correlation_data, 
+        lower = list(continuous = wrap("smooth", method = "lm", se = F, color = "maroon", alpha = 0.5, size = 1)),  # Regression trend
+        upper = list(continuous = wrap("cor", size = 5)),  # Correlation values
+        diag = list(continuous = wrap("densityDiag", fill = "dodgerblue", alpha = 0.3))) +  # Density plots on diagonal
+  theme_minimal() +
+  theme(panel.border = element_rect(color = "black", fill = NA, linewidth = 1))
+```
+
+### Spatial Distribution of Bike Start Stations by Usage Frequency
+```{r}
+# Group the data by station and calculate bike usage count
+start_station_frequency <- bike %>%
+  group_by(start_station_id, start_station_name, start_station_latitude, start_station_longitude) %>%
+  summarise(count = n(), .groups = 'drop')
+
+# Create the map with leaflet, adjusting circle sizes based on count
+leaflet(data = start_station_frequency) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    ~start_station_longitude, ~start_station_latitude,
+    radius = ~sqrt(count) * 0.2,  # Adjust the circle size as needed
+    color = ~colorNumeric("YlGnBu", count)(count), # Apply color scale to circles
+    opacity = 0.7, fillOpacity = 0.5,
+    popup = ~paste("Station: ", start_station_name, "<br>Frequency: ", count)
+  ) %>%
+  setView(lng = mean(start_station_frequency$start_station_longitude), lat = mean(start_station_frequency$start_station_latitude), zoom = 12) %>%
+  addLegend(
+    "bottomright",
+    pal = colorNumeric("YlGnBu", start_station_frequency$count),  # Color scale for legend
+    values = ~count,
+    title = "Frequency",
+    opacity = 0.7
+  )
+```
+
+### Spatial Distribution of Bike End Stations by Usage Frequency
+```{r}
+# Group the data by station and calculate bike usage count
+end_station_frequency <- bike %>%
+  group_by(end_station_id, end_station_name, end_station_latitude, end_station_longitude) %>%
+  summarise(count = n(), .groups = 'drop')
+
+# Create the map with leaflet, adjusting circle sizes based on count
+leaflet(data = end_station_frequency) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    ~end_station_longitude, ~end_station_latitude,
+    radius = ~sqrt(count) * 0.2,  # Adjust the circle size as needed
+    color = ~colorNumeric("YlGnBu", count)(count), # Apply color scale to circles
+    opacity = 0.7, fillOpacity = 0.5,
+    popup = ~paste("Station: ", end_station_name, "<br>Frequency: ", count)
+  ) %>%
+  setView(lng = mean(end_station_frequency$end_station_longitude), lat = mean(end_station_frequency$end_station_latitude), zoom = 12) %>%
+  addLegend(
+    "bottomright",
+    pal = colorNumeric("YlGnBu", end_station_frequency$count),  # Color scale for legend
+    values = ~count,
+    title = "Frequency",
+    opacity = 0.7
+  )
+```
+
+## 1. Unsupervised Learning
+### 1.1 Principal Component Analysis (PCA)
+```{r}
+# Desired total sample size
+sample_size <- 100  
+
+# Total number of rows in the dataset
+total_rows <- nrow(bike)
+
+b1.1 <- bike %>%
+  group_by(start_station_name) %>%
+  sample_frac(size = min(1, (sample_size / total_rows)), replace = FALSE) %>%
+  ungroup()
+
+# Create new dataframe for K-means
+b1.1_pca <- b1.1[, c("duration", "start_station_latitude", "start_station_longitude", "end_station_latitude", "end_station_longitude", "precipitation", "temperature", "wind_speed", "sunshine")]
+
+```
+
+```{r}
+# Standardize the data (center = TRUE ensures mean is 0, scale = TRUE ensures variance is 1)
+b1.1_pca <- prcomp(b1.1_pca, center = TRUE, scale. = TRUE)
+
+summary(b1.1_pca)
+```
+The center and scale components correspond to the means and standard deviations of the variables that were used for scaling prior to implementing PCA.
+
+```{r}
+b1.1_pca$center
+b1.1_pca$scale
+``` 
+ 
+```{r}
+b1.1_pca$rotation
+```
+
+```{r}
+dim(b1.1_pca$x)
+```
+
+```{r}
+# Derive the variance for each principal component
+b1.1_pca.var <- b1.1_pca$sdev^2
+b1.1_pca.var
+
+# Derive the proportion of variance for each principal component
+pve <- b1.1_pca.var / sum(b1.1_pca.var)
+pve
+```
+The first six principal components together explains the majority of the variance. Thus, they will be considered for PCA.
+ 
+#### 1.1.1 Scree Plots to show Proportion of Variance and Cumulative Proportion of Variance 
+```{r}
+# Create a data frame for plotting
+pve_df <- data.frame(PC = seq_along(pve), Proportion = pve, Cumulative = cumsum(pve))
+
+# Function to create plots
+scree_plot <- function(y, y_label, color, title) {
+  ggplot(pve_df, aes(x = PC, y = y)) +
+    geom_point(color = color, size = 3) +
+    geom_line(color = color, linewidth = 1) +
+    scale_x_continuous(breaks = 1:length(pve)) +
+    labs(title = title, x = "Principal Component", y = y_label) +
+    theme_classic() +
+    theme(panel.border = element_rect(color = "black", fill = NA, linewidth = 1))
+}
+
+# Generate both plots
+p1 <- scree_plot(pve_df$Proportion, "Proportion of Variance Explained", title = "", "steelblue")
+p2 <- scree_plot(pve_df$Cumulative, "Cumulative Proportion of Variance Explained", title = "", "maroon")
+
+# Display plots side by side
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### 1.1.2 Principal Component Plots
+```{r}
+par(mfrow = c(1, 3))
+
+# Plot 1st & 2nd principal components
+biplot(b1.1_pca, scale = 0, choices = c(1, 2), 
+       xlab = "First Component (PC1)", ylab = "Second Component (PC2)", 
+       main = "Biplot of PC1 & PC2", cex = 0.7)  
+
+# Plot 3rd & 4th principal components
+biplot(b1.1_pca, scale = 0, choices = c(3, 4), 
+       xlab = "Third Component (PC3)", ylab = "Fourth Component (PC4)", 
+       main = "Biplot of PC3 & PC4", cex = 0.7)  
+
+# Plot 5th & 6th principal components
+biplot(b1.1_pca, scale = 0, choices = c(5, 6), 
+       xlab = "Fifth Component (PC5)", ylab = "Sixth Component (PC6)", 
+       main = "Biplot of PC5 & PC6", cex = 0.7)  
+
+par(mfrow = c(1, 1))
+```
+
+### 1.2 K-means Clustering
+```{r}
+# Desired total sample size
+sample_size <- 500  
+
+# Total number of rows in the dataset
+total_rows <- nrow(bike)
+
+b1.2 <- bike %>%
+  group_by(start_station_name) %>%
+  sample_frac(size = min(1, (sample_size / total_rows)), replace = FALSE) %>%
+  ungroup()
+
+# Create new dataframe for K-means
+b1.2_cluster <- b1.2[, c("duration", "start_station_latitude", "start_station_longitude", "end_station_latitude", "end_station_longitude", "precipitation", "temperature", "wind_speed", "sunshine")]
+
+# Standardize/Scale the data (to avoid any bias in distance calculations due to different scales)
+b1.2_cluster_scaled <- data.frame(scale(b1.2_cluster))
+
+# View the scaled data
+head(b1.2_cluster_scaled)
+```
+
+```{r}
+# Generate a random number sequence by set.seed() to verify results
+set.seed(2025)
+
+# Start with 2 clusters
+km.out <- kmeans(b1.2_cluster_scaled, 2, nstart = 20)
+km.out$cluster
+```
+
+#### 1.2.1 Determining the Optimal Value of K
+##### Elbow Method (Within-Cluster Sum of Squares, WCSS)
+```{r}
+# Generate a random number sequence by set.seed() to verify results
+set.seed(2025)
+
+# Define maximum number of clusters
+k.max <- 10
+
+wcss <- numeric(k.max)
+for(k in 1:k.max){
+  model <- kmeans(b1.2_cluster_scaled, centers = k, nstart = 50, iter.max = 100)
+  wcss[k] <- model$tot.withinss
+} 
+
+# Create a dataframe for k-value and WCSS
+wcss_df <- data.frame(
+  k = 1:k.max,
+  WCSS = wcss
+)
+
+# Create a visualization plot
+ggplot(wcss_df, aes(x = k, y = WCSS)) +
+  geom_point(color = "steelblue", size = 3) + 
+  geom_line(color = "steelblue", linewidth = 1) + 
+  labs(x = "Number of Clusters", 
+       y = "Within-Cluster Sum of Squares (WCSS)", 
+       title = "Elbow Method for Optimal K") + 
+  theme_minimal() +
+  theme(panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+        panel.grid = element_blank())
+```
+We determine that this method is inconclusive due to a smooth decline in within cluster variance rather than a distinct elbow.
+
+##### Silhouette Method
+```{r}
+# Generate a random number sequence by set.seed() to verify results
+set.seed(2025)
+
+# Silhouette score function
+sil_score <- function(k){
+  km <- kmeans(b1.2_cluster_scaled, centers = k, nstart = 50, iter.max = 100)
+  ss <- silhouette(km$cluster, dist(b1.2_cluster_scaled))
+  mean(ss[,3])
+}
+
+# Define range of k values
+k.max <- 10
+k <- 2:k.max
+
+# Calculate average silhouette scores for each k
+avg_sil <-sapply(k, sil_score)
+
+# Create a data frame for plotting
+sil_df <- data.frame(k = k, avg_sil = avg_sil)
+
+# Find the optimal number of clusters
+opt_k <- sil_df$k[which.max(sil_df$avg_sil)]
+
+# Create a visualization plot
+ggplot(sil_df, aes(x = k, y = avg_sil)) +
+  geom_point(color = "steelblue", size = 3) + 
+  geom_line(color = "steelblue", size = 1) + 
+  labs(x = "Number of Clusters", 
+       y = "Average Silhouette Scores", 
+       title = "Silhouette Method for Optimal K") + 
+  annotate("point", x = opt_k, y = max(avg_sil), color = "red", size = 3) +  # Highlight optimal k
+  geom_vline(xintercept = opt_k, linetype = "dashed", color = "red") +  # Add vertical line at optimal k
+  theme_minimal() +
+  theme(panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+        panel.grid = element_blank())
+```
+We observe that the optimal value of k is 2 since it presents the highest silhouette scores.
+
+```{r}
+# Create a cluster plot for visualization 
+# Generate a random number sequence by set.seed() to verify results
+set.seed(2025)
+
+km_silhouette <- kmeans(b1.2_cluster_scaled, centers = which.max(avg_sil) + 1, nstart = 50)
+
+fviz_cluster(km_silhouette, data = b1.2_cluster_scaled,
+             palette = c("purple", "orange"),
+             geom = "point",
+             ellipse.type = "convex",
+             ggtheme = theme_minimal() +
+               theme(panel.border = element_rect(color = "black", fill = NA, linewidth = 1), 
+                     panel.grid = element_blank())
+             ) +  ggtitle("K-means Cluster Plot") 
+```
+
+##### Gap Statistic Method
+```{r}
+# Generate a random number sequence by set.seed() to verify results
+set.seed(2025)
+
+gap.stat <- clusGap(b1.2_cluster_scaled, FUNcluster = kmeans, k.max, nstart = 50, iter.max = 100, B = 100)
+
+print(gap.stat, method = "firstmax")
+
+Gap_plot <- fviz_gap_stat(gap.stat)
+
+Gap_plot + ggtitle("Gap Statistic method")
+```
+We observe that the Gap Statistic method suggested a single cluster.
+
+```{r}
+# Create a cluster plot for visualization
+# Generate a random number sequence by set.seed() to verify results
+set.seed(2025)
+
+km_gap <- kmeans(b1.2_cluster_scaled, centers = 1, nstart = 50)
+
+fviz_cluster(km_gap, data = b1.2_cluster_scaled,
+             palette = c("purple"),
+             geom = "point",
+             ellipse.type = "convex",
+             ggtheme = theme_minimal() +
+               theme(panel.border = element_rect(color = "black", fill = NA, linewidth = 1), 
+                     panel.grid = element_blank())
+             ) + ggtitle("K-means Cluster Plot") 
+```
+
+### 1.3 Hierarchical Clustering 
+```{r}
+# Compute the distance matrix (Euclidean distance is the default method)
+data.dist <- dist(b1.2_cluster_scaled)
+
+# Create the hierarchical clustering using different linkage methods
+par(mfrow = c(1, 3))
+
+# Complete Linkage method
+plot(hclust(data.dist), xlab = "", sub = "", ylab = "", main = "Complete Linkage")
+
+# Average Linkage method
+plot(hclust(data.dist, method = "average"), xlab = "", sub = "", ylab = "", main = "Average Linkage")
+
+# Single Linkage method
+plot(hclust(data.dist, method = "single"), xlab = "", sub = "", ylab = "", main = "Single Linkage")
+
+# Ward Linkage method
+plot(hclust(data.dist, method = "ward.D2"), xlab = "", sub = "", ylab = "", main = "Ward Linkage")
+```
+
+#### 1.3.1 Deriving Agglomerative Coefficient for each Linkage Method
+```{r}
+# Derive agglomerative coefficient for each linkage method (The closer to 1, the stronger the cluster structure is)
+
+columns <- c("complete", "single", "average", "ward")
+
+agnes_coefficient <- data.frame(matrix(nrow = 1, ncol = length(columns)))
+
+colnames(agnes_coefficient) <- columns
+
+agnes_coefficient[1,1] <- agnes(b1.2_cluster_scaled, method = "complete")$ac
+agnes_coefficient[1,2] <- agnes(b1.2_cluster_scaled, method = "single")$ac
+agnes_coefficient[1,3] <- agnes(b1.2_cluster_scaled, method = "average")$ac
+agnes_coefficient[1,4] <- agnes(b1.2_cluster_scaled, method = "ward")$ac
+
+agnes_coefficient 
+```
+We observe that the Ward Linkage method has the highest agglomerative coefficient among the four methods. Therefore, we select Ward Linkage method to measure the dissimilarity between clusters.`
+
+### 1.4 Results from Hierarchical Clustering and Ward Linkage menthod
+```{r}
+# Perform hierarchical clustering using agnes with Ward Linkage
+ward <- agnes(b1.2_cluster_scaled, method = "ward")
+pltree(ward, cex = 0.4, hang = -1, main = "Dendrogram of agnes")
+```
+
+```{r}
+# Perform hierarchical clustering using hclust with Ward linkage
+ward <- hclust(dist(b1.2_cluster_scaled), method = "ward.D2")
+```
+
+```{r}
+# Cut the dendrogram at k = 2 (selected by Silhouette method) clusters
+hc_ct_sil <- cutree(ward, k = 2)
+table(hc_ct_sil)
+plot(ward, cex = 0.7)
+rect.hclust(ward, k = 2, border = 3:7)
+```
+
+```{r}
+# Plot the cluster plot for Silhouette method (k = 2)
+fviz_cluster(list(data = b1.2_cluster_scaled, cluster = hc_ct_sil),
+             palette = c("purple", "orange"),
+             geom = "point",
+             ellipse.type = "convex",
+             ggtheme = theme_minimal() +
+               theme(panel.border = element_rect(color = "black", fill = NA, linewidth = 1), 
+                     panel.grid = element_blank())
+             ) + ggtitle("K-means Cluster Plot") 
+```
